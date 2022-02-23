@@ -19,7 +19,8 @@ setup(
     'pillow',
     'torch',
     'torchvision',
-    'tqdm'
+    'tqdm',
+    'git+https://github.com/xvdp/ko.git'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

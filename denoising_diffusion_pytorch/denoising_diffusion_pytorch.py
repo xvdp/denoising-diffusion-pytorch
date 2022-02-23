@@ -1,3 +1,9 @@
+"""@xvdp minor modifications for local running
+"""
+import os.path as osp
+from re import M
+import time
+import random
 import math
 import copy
 import torch
@@ -22,8 +28,9 @@ try:
 except:
     APEX_AVAILABLE = False
 
-# helpers functions
+# pylint: disable=no-member
 
+# helpers functions
 def exists(x):
     return x is not None
 
@@ -289,18 +296,19 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     return np.clip(betas, a_min = 0, a_max = 0.999)
 
 class GaussianDiffusion(nn.Module):
+    """ removed arg channels, read from denoise_fn.channels
+    """
     def __init__(
         self,
         denoise_fn,
         *,
         image_size,
-        channels = 3,
         timesteps = 1000,
         loss_type = 'l1',
         betas = None
     ):
         super().__init__()
-        self.channels = channels
+        self.channels = denoise_fn.channels
         self.image_size = image_size
         self.denoise_fn = denoise_fn
 
@@ -387,7 +395,8 @@ class GaussianDiffusion(nn.Module):
         b = shape[0]
         img = torch.randn(shape, device=device)
 
-        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+        for i in tqdm(reversed(range(0, self.num_timesteps)),
+                      desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
         return img
 
@@ -441,16 +450,20 @@ class GaussianDiffusion(nn.Module):
         b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        # print(f"  GaussianDiffusion().forward(), t {t}, timesteps {self.num_timesteps}")
         return self.p_losses(x, t, *args, **kwargs)
 
 # dataset classes
 
 class Dataset(data.Dataset):
-    def __init__(self, folder, image_size, exts = ['jpg', 'jpeg', 'png']):
+    """ added channels arg
+    """
+    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png'], channels=3):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        self.channels = channels
 
         self.transform = transforms.Compose([
             transforms.Resize(image_size),
@@ -465,10 +478,31 @@ class Dataset(data.Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
-        img = Image.open(path)
+        try: # fault tolerant image loading
+            img = Image.open(path)
+            if self.channels == 1:
+                img = img.convert('L')
+            else:
+                img = img.convert('RGB')
+        except:
+            return self.__getitem__(random.randint(0,len(self.paths)))
         return self.transform(img)
 
 # trainer class
+def strf (x):
+    """ format time output
+    strf = lambda x: f"{int(x//86400)}D{int((x//3600)%24):02d}:{int((x//60)%60):02d}:{int(x%60):02d}s"
+    """
+    days = int(x//86400)
+    hours = int((x//3600)%24)
+    minutes = int((x//60)%60)
+    seconds = int(x%60)
+    out = f"{minutes:02d}:{seconds:02d}"
+    if hours or days:
+        out = f"{hours:02d}:{out}"
+        if days:
+            out = f"{days}_{out}"
+    return out
 
 class Trainer(object):
     def __init__(
@@ -477,8 +511,7 @@ class Trainer(object):
         folder,
         *,
         ema_decay = 0.995,
-        image_size = 128,
-        train_batch_size = 32,
+        train_batch_size = 48, 
         train_lr = 2e-5,
         train_num_steps = 100000,
         gradient_accumulate_every = 2,
@@ -486,8 +519,16 @@ class Trainer(object):
         step_start_ema = 2000,
         update_ema_every = 10,
         save_and_sample_every = 1000,
-        results_folder = './results'
+        results_folder = './results',
+        milestone = None
     ):
+        """
+        removed image_size & channels (get from diffusion_model)
+        added:  milestone [None]
+
+        Notes:
+            * fp16 on single TitanRTX is 2x slower
+        """
         super().__init__()
         self.model = diffusion_model
         self.ema = EMA(ema_decay)
@@ -502,7 +543,7 @@ class Trainer(object):
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
 
-        self.ds = Dataset(folder, image_size)
+        self.ds = Dataset(folder, self.image_size, channels=diffusion_model.channels)
         self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, pin_memory=True))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
 
@@ -517,7 +558,10 @@ class Trainer(object):
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
 
-        self.reset_parameters()
+        if milestone is not None:
+            self.load(milestone)
+        else:
+            self.reset_parameters()
 
     def reset_parameters(self):
         self.ema_model.load_state_dict(self.model.state_dict())
@@ -537,20 +581,33 @@ class Trainer(object):
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
+        """
+        """
+        if not osp.isfile(milestone):
+            milestone = osp.join(self.results_folder, f'model-{milestone}.pt')
+        assert osp.isfile(milestone), f"could not load milestone {milestone}"
 
+        data = torch.load(milestone)
         self.step = data['step']
         self.model.load_state_dict(data['model'])
         self.ema_model.load_state_dict(data['ema'])
 
     def train(self):
+        time_start = time.time()
         backwards = partial(loss_backwards, self.fp16)
+        offset_step = self.step
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl).cuda()
                 loss = self.model(data)
-                print(f'{self.step}: {loss.item()}')
+
+                total_time = time.time() - time_start
+                step = self.step + 1
+                iter_time = total_time / (step - offset_step)
+                remain_time = (self.train_num_steps - step) * iter_time
+                print(f'{[self.step]} {loss.item():.3f}  time /it {iter_time:.3f} elapsed {strf(total_time)} remain {strf(remain_time)} data {tuple(data.shape)}')
+
                 backwards(loss / self.gradient_accumulate_every, self.opt)
 
             self.opt.step()
