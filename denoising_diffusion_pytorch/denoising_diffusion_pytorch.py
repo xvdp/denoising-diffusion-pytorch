@@ -1,4 +1,18 @@
 """@xvdp minor modifications for local running
+Trainer:
+    added self._cont() creating a '_continue_training'  file in results: delete file to terminate training
+    added more verbose logging for time
+    added 'milestone' arg: to load milestone
+    removed 'channels' arg: grab from diffusion model
+    removed inference on first step when loading milestones
+
+Dataset:
+    added robust loading (skip if bad file, ensure channels are correct)
+    added channels arg
+
+GaussianDiffusion:
+    removed 'channels' arg: grab from unet
+ 
 """
 import os
 import os.path as osp
@@ -403,9 +417,28 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch_size = 16):
-        image_size = self.image_size
-        channels = self.channels
-        return self.p_sample_loop((batch_size, channels, image_size, image_size))
+        shape = (batch_size, self.channels, self.image_size, self.image_size)
+        return self.p_sample_loop(shape)
+
+    ## sampling experiments
+    # input image instead of rnd
+    # video out
+    @torch.no_grad()
+    def sample_from(self, img, timesteps=None):
+        return self.p_sample_loop_from(img, timesteps=timesteps)
+
+    @torch.no_grad()
+    def p_sample_loop_from(self, img, timesteps=None):
+        device = self.betas.device
+        img = img.to(device=device)
+        timesteps = timesteps if timesteps is not None else self.num_timesteps
+
+        b = img.shape[0]
+        for i in tqdm(reversed(range(0, timesteps)),
+                      desc='sampling loop time step', total=timesteps):
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+        return img
+
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -638,7 +671,7 @@ class Trainer(object):
                 self.save(milestone, verbose=True)
 
                 if not self._cont():
-                    _msg(f"interupted training, at step {self.step}")
+                    _msg = f"interupted training, at step {self.step}"
                     break
 
             self.step += 1
