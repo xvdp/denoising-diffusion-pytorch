@@ -12,7 +12,7 @@ train:
   update_ema_every: 10
   save_and_sample_every: 1000
   results_folder: './results_multitudes'  # training floder
-  milestone: '53' # load last milestone
+  milestone: 'last' # load last milestone | or number '15000'
 
 diffusion:
   image_size: 128

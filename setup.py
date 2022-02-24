@@ -1,5 +1,9 @@
 from setuptools import setup, find_packages
 
+def get_required():
+    with open('requirements.txt') as f:
+        return f.read().splitlines()
+
 setup(
   name = 'denoising-diffusion-pytorch',
   packages = find_packages(),
@@ -20,7 +24,7 @@ setup(
     'torch',
     'torchvision',
     'tqdm',
-    'git+https://github.com/xvdp/ko.git'
+    "koreto @ git+https://github.com/xvdp/koreto.git"
   ],
   classifiers=[
     'Development Status :: 4 - Beta',
@@ -30,3 +34,11 @@ setup(
     'Programming Language :: Python :: 3.6',
   ],
 )
+
+"""
+ # https://github.com/pypa/pip/issues/3939
+install_requires = [
+      'somerepo @ https://api.github.com/repos/User/somerepo/tarball/v0.1.1',
+],
+'koreto @ https://api.github.com/repos/xvdp/koreto' #/tarball/v0.0.7'
+"""

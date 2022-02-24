@@ -1,9 +1,10 @@
 """@xvdp minor modifications for local running
 """
+import os
 import os.path as osp
-from re import M
 import time
 import random
+
 import math
 import copy
 import torch
@@ -524,7 +525,7 @@ class Trainer(object):
     ):
         """
         removed image_size & channels (get from diffusion_model)
-        added:  milestone [None]
+        added:  milestone [None] loads milestone if found
 
         Notes:
             * fp16 on single TitanRTX is 2x slower
@@ -558,7 +559,14 @@ class Trainer(object):
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
 
+        if milestone == 'last':
+            inf = sorted([f.path for f in os.scandir(self.results_folder)
+                            if f.name[-3:] ==".pt"],
+                            key=lambda x: int(x.split(".")[0].split("-")[1]))
+            milestone = inf[-1] if inf else None
+
         if milestone is not None:
+            print(f"loading milestone {milestone}")
             self.load(milestone)
         else:
             self.reset_parameters()
@@ -572,7 +580,7 @@ class Trainer(object):
             return
         self.ema.update_model_average(self.ema_model, self.model)
 
-    def save(self, milestone):
+    def save(self, milestone, verbose=False):
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
@@ -595,7 +603,10 @@ class Trainer(object):
     def train(self):
         time_start = time.time()
         backwards = partial(loss_backwards, self.fp16)
-        offset_step = self.step
+        zero_step = self.step
+
+        self._cont(True)
+        _msg = ""
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
@@ -604,7 +615,7 @@ class Trainer(object):
 
                 total_time = time.time() - time_start
                 step = self.step + 1
-                iter_time = total_time / (step - offset_step)
+                iter_time = total_time / (step - zero_step)
                 remain_time = (self.train_num_steps - step) * iter_time
                 print(f'{[self.step]} {loss.item():.3f}  time /it {iter_time:.3f} elapsed {strf(total_time)} remain {strf(remain_time)} data {tuple(data.shape)}')
 
@@ -616,15 +627,30 @@ class Trainer(object):
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-            if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                milestone = self.step // self.save_and_sample_every
+            if not self._cont() or (self.step != zero_step and self.step % self.save_and_sample_every == 0):
+                milestone = self.step # // self.save_and_sample_every
                 batches = num_to_groups(36, self.batch_size)
                 all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
                 all_images = torch.cat(all_images_list, dim=0)
                 all_images = (all_images + 1) * 0.5
-                utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = 6)
-                self.save(milestone)
+                image_name = osp.join(self.results_folder, f'sample-{milestone}.png')
+                utils.save_image(all_images, image_name, nrow = 6)
+                self.save(milestone, verbose=True)
+
+                if not self._cont():
+                    _msg(f"interupted training, at step {self.step}")
+                    break
 
             self.step += 1
 
-        print('training completed')
+        print(f'training completed {_msg}')
+
+    def _cont(self, init=False):
+        """
+        Create place holder file. Kill file to stop training.
+        """
+        _cont = osp.join(self.results_folder, "_continue_training")
+        if init and not osp.isfile(_cont):
+            with open(_cont, "w") as _fi:
+                pass
+        return osp.isfile(_cont)
