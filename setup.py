@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
   name = 'denoising-diffusion-pytorch',
   packages = find_packages(),
-  version = '0.7.1',
+  version = '0.7.1.1',
   license='MIT',
   description = 'Denoising Diffusion Probabilistic Models - Pytorch',
   author = 'Phil Wang',
@@ -20,7 +20,8 @@ setup(
     'torch',
     'torchvision',
     'tqdm',
-    "koreto @ git+https://github.com/xvdp/koreto.git"
+    "koreto @ git+https://github.com/xvdp/koreto.git",
+    "vidi @ git+https://github.com/xvdp/vidi.git",
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

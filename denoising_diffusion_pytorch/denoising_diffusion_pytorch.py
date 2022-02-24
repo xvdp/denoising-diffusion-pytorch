@@ -37,6 +37,8 @@ import numpy as np
 from tqdm import tqdm
 from einops import rearrange
 
+import vidi # for video out
+
 try:
     from apex import amp
     APEX_AVAILABLE = True
@@ -73,6 +75,14 @@ def loss_backwards(fp16, loss, optimizer, **kwargs):
             scaled_loss.backward(**kwargs)
     else:
         loss.backward(**kwargs)
+
+def numpy_grid(x, pad=0, nrow=None, uint8=True):
+    x = x.clone().detach().cpu()
+    nrow = nrow if nrow is not None else int(math.sqrt(x.shape[0]))
+    x = ((utils.make_grid(x, nrow=nrow, padding=pad).permute(1,2,0) - x.min())/(x.max()-x.min())).numpy()
+    if uint8:
+        x = (x*255).astype("uint8")
+    return x
 
 # small helper modules
 
@@ -423,6 +433,31 @@ class GaussianDiffusion(nn.Module):
     ## sampling experiments
     # input image instead of rnd
     # video out
+
+    @torch.no_grad()
+    def p_sample_loop_vid(self, shape, name="sample.mp4", play=False):
+        device = self.betas.device
+
+        b = shape[0]
+        img = torch.randn(shape, device=device)
+
+        _img = numpy_grid(img)
+        with vidi.FFcap(name, size=_img.shape[:2], fps=25) as F:
+            F.add_frame(_img)
+
+            for i in tqdm(reversed(range(0, self.num_timesteps)),
+                        desc='sampling loop time step', total=self.num_timesteps):
+                img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+                F.add_frame(numpy_grid(img))
+        if play:
+            vidi.ffplay(name)
+        return name
+
+    @torch.no_grad()
+    def sample_vid(self, batch_size=16, name="sample.mp4", play=False):
+        shape = (batch_size, self.channels, self.image_size, self.image_size)
+        return self.p_sample_loop_vid(shape, name=name, play=play)
+
     @torch.no_grad()
     def sample_from(self, img, timesteps=None):
         return self.p_sample_loop_from(img, timesteps=timesteps)

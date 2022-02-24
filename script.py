@@ -42,6 +42,24 @@ def run(config="config_multitudes.yaml"):
     trainer = Trainer(diffusion, data, **train_params)
     trainer.train()
 
+def sample_vid(config="config_multitudes.yaml", milestone=None, batch_size=16, ema=True, play=True):
+    """ loads 'milestone' from 'results_folder' spec'd in 'config_....yaml'
+    renders video of sampling loop
+    """
+    model_params, diffusion_params, train_params, data = load_config(config)
+    if milestone is not None:
+        train_params['milestone'] = milestone
+    model = Unet(**model_params).cuda()
+    diffusion = GaussianDiffusion(model, **diffusion_params).cuda()
+    trainer = Trainer(diffusion, data, **train_params)
+
+    name = osp.join(trainer.results_folder, f"{('ema' if ema else 'raw')}_sample-{trainer.step}.mp4")
+    if ema:
+        name = trainer.ema_model.sample_vid(batch_size=batch_size, name=name, play=play)
+    else:
+        name = trainer.model.sample_vid(batch_size=batch_size, name=name, play=play)
+    print(f"saved video to {name}")
+
 if __name__ == "__main__":
     """
     python train.py myconfigfile.yaml

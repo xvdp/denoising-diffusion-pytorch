@@ -76,6 +76,15 @@ trainer.train()
 
 Samples and model checkpoints will be logged to `./results` periodically
 
+## xvdp modifications
+* config.yaml for training
+* script.py wrapping training or sampling
+
+    -   edit config.yaml, call script.run(config=<>)
+
+* .sample_vid() saving sample generation to video
+* notebook inspecting parameters of model
+
 ## Citations
 
 ```bibtex
