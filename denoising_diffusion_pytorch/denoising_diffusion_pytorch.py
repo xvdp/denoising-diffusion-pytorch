@@ -77,8 +77,14 @@ def loss_backwards(fp16, loss, optimizer, **kwargs):
         loss.backward(**kwargs)
 
 def numpy_grid(x, pad=0, nrow=None, uint8=True):
+    """ thin wrap to make_grid to return frames ready to save to file
+    args
+        pad     (int [0])   same as utils.make_grid(padding)
+        nrow    (int [None]) # defaults to horizonally biased rectangle closest to square
+        uint8   (bool [True]) convert to img in range 0-255 uint8
+    """
     x = x.clone().detach().cpu()
-    nrow = nrow if nrow is not None else int(math.sqrt(x.shape[0]))
+    nrow = nrow or int(math.sqrt(x.shape[0]))
     x = ((utils.make_grid(x, nrow=nrow, padding=pad).permute(1,2,0) - x.min())/(x.max()-x.min())).numpy()
     if uint8:
         x = (x*255).astype("uint8")
@@ -414,26 +420,34 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape):
+    def p_sample_loop(self, shape, step=1):
         device = self.betas.device
 
         b = shape[0]
         img = torch.randn(shape, device=device)
 
-        for i in tqdm(reversed(range(0, self.num_timesteps)),
+        for i in tqdm(reversed(range(0, self.num_timesteps, step)),
                       desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16):
-        shape = (batch_size, self.channels, self.image_size, self.image_size)
-        return self.p_sample_loop(shape)
+    def sample(self, batch_size=16, height=None, width=None, seed=None, step=1):
+        """ added args
+                'seed'              reproducibility testing
+                'width' 'height'    test different sizes
+                'step'              test skipping markov steps
+        """
+        height = height or self.image_size
+        width = width or self.image_size
+        if seed is not None:
+            torch.manual_seed(seed)
+        shape = (batch_size, self.channels, height, width)
+        return self.p_sample_loop(shape, step=step)
 
     ## sampling experiments
     # input image instead of rnd
-    # video out
-
+    # 1. video out
     @torch.no_grad()
     def p_sample_loop_vid(self, shape, name="sample.mp4", play=False):
         device = self.betas.device
