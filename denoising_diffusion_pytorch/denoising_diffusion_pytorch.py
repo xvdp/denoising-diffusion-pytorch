@@ -38,6 +38,7 @@ from tqdm import tqdm
 from einops import rearrange
 
 import vidi # for video out
+from .util import numpy_grid, strf
 
 try:
     from apex import amp
@@ -76,19 +77,6 @@ def loss_backwards(fp16, loss, optimizer, **kwargs):
     else:
         loss.backward(**kwargs)
 
-def numpy_grid(x, pad=0, nrow=None, uint8=True):
-    """ thin wrap to make_grid to return frames ready to save to file
-    args
-        pad     (int [0])   same as utils.make_grid(padding)
-        nrow    (int [None]) # defaults to horizonally biased rectangle closest to square
-        uint8   (bool [True]) convert to img in range 0-255 uint8
-    """
-    x = x.clone().detach().cpu()
-    nrow = nrow or int(math.sqrt(x.shape[0]))
-    x = ((utils.make_grid(x, nrow=nrow, padding=pad).permute(1,2,0) - x.min())/(x.max()-x.min())).numpy()
-    if uint8:
-        x = (x*255).astype("uint8")
-    return x
 
 # small helper modules
 
@@ -305,14 +293,49 @@ class Unet(nn.Module):
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
+    """
+    return a[t].view(x_shape[0], *[1]*(len(x_shape)-1))
+
+    """
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-def noise_like(shape, device, repeat=False):
+def noise_like(shape, device, repeat=False, **kwargs):
+  
+    if "scale" in kwargs and kwargs["scale"] > 1 or "tile" in kwargs and kwargs["tile"] > 1:
+        return _noise_like(shape, device, repeat=False, **kwargs)
     repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
     noise = lambda: torch.randn(shape, device=device)
-    return repeat_noise() if repeat else noise()
+    out = repeat_noise() if repeat else noise()
+
+    return out
+
+def _noise_like(shape, device, repeat=False, scale=1, interpolation="nearest", tile=1):
+    """
+    repeat, same noise for every batch sample
+    scale   upsample noise by factors:
+        TEST: upsampled deterministic noise returns garbage outside of the trained manifold
+    tile    tile noise
+        TEST: tiled deterministic noise returns tiles differnetn but on the same palette range than nontiled
+
+    """
+    if scale > 1:
+        shape = [*shape[:2], shape[2]//scale, shape[3]//scale]
+    if tile > 1:
+        div = 2**(tile-1)
+        shape = [*shape[:2], shape[2]//div, shape[3]//div]
+
+    repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
+    noise = lambda: torch.randn(shape, device=device)
+    out = repeat_noise() if repeat else noise()
+
+    if scale > 1:
+        out = torch.nn.functional.interpolate(out, scale_factor=scale, mode=interpolation)
+    for _ in range(tile - 1):
+        out = torch.cat((out, out), dim=2)
+        out = torch.cat((out, out), dim=3)
+    return out
 
 def cosine_beta_schedule(timesteps, s = 0.008):
     """
@@ -325,6 +348,34 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return np.clip(betas, a_min = 0, a_max = 0.999)
+
+##
+# original beta schedules
+#
+def _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, warmup_frac):
+    betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
+    warmup_time = int(num_diffusion_timesteps * warmup_frac)
+    betas[:warmup_time] = np.linspace(beta_start, beta_end, warmup_time, dtype=np.float64)
+    return betas
+
+def original_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
+    if beta_schedule == 'quad':
+        betas = np.linspace(beta_start ** 0.5, beta_end ** 0.5, num_diffusion_timesteps, dtype=np.float64) ** 2
+    elif beta_schedule == 'linear':
+        betas = np.linspace(beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64)
+    elif beta_schedule == 'warmup10':
+        betas = _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, 0.1)
+    elif beta_schedule == 'warmup50':
+        betas = _warmup_beta(beta_start, beta_end, num_diffusion_timesteps, 0.5)
+    elif beta_schedule == 'const':
+        betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
+    elif beta_schedule == 'jsd':  # 1/T, 1/(T-1), 1/(T-2), ..., 1
+        betas = 1. / np.linspace(num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64)
+    else:
+        raise NotImplementedError(beta_schedule)
+    assert betas.shape == (num_diffusion_timesteps,)
+    return betas
+
 
 class GaussianDiffusion(nn.Module):
     """ removed arg channels, read from denoise_fn.channels
@@ -380,6 +431,9 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer('posterior_mean_coef2', to_torch(
             (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
 
+        self.out = None
+        self.outstep=10
+
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
         variance = extract(1. - self.alphas_cumprod, t, x_start.shape)
@@ -392,6 +446,7 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
+
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
@@ -402,33 +457,132 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, x, t, clip_denoised: bool):
-        x_recon = self.predict_start_from_noise(x, t=t, noise=self.denoise_fn(x, t))
-
+        noise=self.denoise_fn(x, t)
+        self.appendout(noise, f"1.-> x1 = U(x) : unet μ{noise.mean().item():.3f}, σ{noise.std().item():.3f}") # 1
+        x_recon = self.predict_start_from_noise(x, t=t,noise=noise)
+        self.appendout(x_recon, f"2.-> x1 = x1√(1/Πα) - x0/√(1/Πα - 1)) : predict start μ{x_recon.mean().item():.3f}, σ{x_recon.std().item():.3f}") # 2
         if clip_denoised:
             x_recon.clamp_(-1., 1.)
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
+        self.appendout(model_mean, f"3.-> x1 c_1 + x0 c_2 : model_mean μ{model_mean.mean().item():.3f}, σ{model_mean.std().item():.3f}") # 2
         return model_mean, posterior_variance, posterior_log_variance
 
+    def _predict_start_from_noise(self, x, t, noise):
+        """ same as above, fore readability
+        """
+        _a = self.sqrt_recip_alphas_cumprod
+        _b = self.sqrt_recipm1_alphas_cumprod
+        shape = (len(x), *[1] * (x.dim() - 1)) # (b, ...ones)
+
+        return _a[t].view(shape)*x - _b[t].view(shape)*noise
+
+    def _q_posterior(self, x_start, x, t):
+        _c1 = self.posterior_mean_coef1
+        _c2 = self.posterior_mean_coef2
+        shape = (len(x), *[1] * (x.dim() - 1)) # (b, ...ones)
+
+        post_mean = _c1[t].view(shape)*x_start + _c2[t].view(shape)*x
+        self.appendout(post_mean)
+
+        post_var = self.posterior_variance[t].view(shape)
+        post_log_var_clipped = self.posterior_log_variance_clipped[t].view(shape)
+ 
+        return post_mean, post_var, post_log_var_clipped
+
     @torch.no_grad()
-    def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
+    def _p_mean_variance(self, x, t, clip_denoised: bool):
+        # run UNet once forward
+        noise=self.denoise_fn(x, t)
+        self.appendout(noise, "-> U(x)")
+        x_recon = self._predict_start_from_noise(x, t=t, noise=noise)
+        self.appendout(x_recon, "-> model mean")
+
+        if clip_denoised:
+            x_recon.clamp_(-1., 1.)
+
+        return self._q_posterior(x_start=x_recon, x=x, t=t)
+
+
+    def appendout(self, x, msg=None):
+        if self.out is not None and (not self.step or self.step == self.num_timesteps-1 or not self.step%(self.num_timesteps//self.outstep)):
+            self.out.append(x.cpu().clone().detach())
+            if msg is not None:
+                print(msg)
+
+    @torch.no_grad()
+    def sample_steps(self, batch_size=1, seed=None, step=None):
+        self.outstep = step or self.outstep
+        self.out = []
+
+        if seed is not None:
+            torch.manual_seed(seed)
+        shape = (batch_size, self.channels, self.image_size, self.image_size)
+        return self.p_sample_loop(shape)
+
+    @torch.no_grad()
+    def p_sample(self, x, t, clip_denoised=True, repeat_noise=False, scale=1, interpolation="nearest", tile=1):
+ 
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
-        noise = noise_like(x.shape, device, repeat_noise)
+
+        noise = noise_like(x.shape, device, repeat_noise, #ORIGINAL ARGS
+                          scale=scale, interpolation=interpolation, tile=tile) # TEST ARGS
+
+        self.appendout(noise, f"4.-> noise_like(x) μ{noise.mean().item():.3f}, σ{noise.std().item():.3f}")
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, step=1):
-        device = self.betas.device
+    def _p_sample(self, x, t, clip_denoised=True):
+        """
+        Args
+            x               tensor (b, h, h, w) markov chain step, initialized as torch.randn(shape) at x_0
+            t               tensor (b)  blend factor, on fwd step initialized as torch.full((b,), i), 1000>i>=0
+            # clip_denoised   bool (True) clamp -1,1 # disabled
+            repeat_noise    bool (False) same noise for every batch sample
+        """
+        b, h, h, w = x.shape
+        model_mean, _, model_log_variance = self._p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+        self.appendout(model_mean, "-> model mean")
 
+        noise = torch.randn(x.shape, device=x.device)
+
+        # no noise when t == 0
+        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+    @torch.no_grad()
+    def p_sample_loop(self, shape, step=1, scale=1, interpolation="nearest", tile=1):
+    
+        device = self.betas.device
         b = shape[0]
         img = torch.randn(shape, device=device)
 
         for i in tqdm(reversed(range(0, self.num_timesteps, step)),
                       desc='sampling loop time step', total=self.num_timesteps):
-            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+            self.step = i
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long),
+                                scale=scale, interpolation=interpolation, tile=tile)
+            self.appendout(img, f"out = mean + noise*e^(logvar/2)  μ{img.mean().item():.3f}, σ{img.std().item():.3f}")
+        return img
+
+    @torch.no_grad()
+    def _p_sample_loop(self, shape, step=1):
+    
+        device = self.betas.device
+        b = shape[0]
+        img = torch.randn(shape, device=device)
+
+        for i in tqdm(reversed(range(0, self.num_timesteps, step)),
+                      desc='sampling loop time step', total=self.num_timesteps):
+            self.step = i
+            img = self._p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+            self.appendout(img)
+
+        if self.out is not None:
+            self.out = torch.cat(self.out)
         return img
 
     @torch.no_grad()
@@ -436,7 +590,7 @@ class GaussianDiffusion(nn.Module):
         """ added args
                 'seed'              reproducibility testing
                 'width' 'height'    test different sizes
-                'step'              test skipping markov steps
+                'step'              test skipping markov steps # useless results
         """
         height = height or self.image_size
         width = width or self.image_size
@@ -445,7 +599,10 @@ class GaussianDiffusion(nn.Module):
         shape = (batch_size, self.channels, height, width)
         return self.p_sample_loop(shape, step=step)
 
-    ## sampling experiments
+
+    ###
+    # sampling experiments
+    #
     # input image instead of rnd
     # 1. video out
     @torch.no_grad()
@@ -473,22 +630,23 @@ class GaussianDiffusion(nn.Module):
         return self.p_sample_loop_vid(shape, name=name, play=play)
 
     @torch.no_grad()
-    def sample_from(self, img, timesteps=None):
-        return self.p_sample_loop_from(img, timesteps=timesteps)
+    def sample_from(self, img, timesteps=None, scale=1, interpolation="nearest", tile=1):
+        return self.p_sample_loop_from(img, timesteps=timesteps, scale=scale, interpolation=interpolation, tile=tile)
 
     @torch.no_grad()
-    def p_sample_loop_from(self, img, timesteps=None):
+    def p_sample_loop_from(self, img, timesteps=None, scale=1, interpolation="nearest", tile=1):
         device = self.betas.device
         img = img.to(device=device)
-        timesteps = timesteps if timesteps is not None else self.num_timesteps
+        timesteps = timesteps or self.num_timesteps
 
         b = img.shape[0]
         for i in tqdm(reversed(range(0, timesteps)),
                       desc='sampling loop time step', total=timesteps):
-            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long), scale=scale,
+                                interpolation=interpolation, tile=tile)
         return img
 
-
+    # unused
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
@@ -505,6 +663,7 @@ class GaussianDiffusion(nn.Module):
 
         return img
 
+    # q_sample, per batch sample: x*sqrt(alpha) + noise*(1-sqrt(alpha))
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -513,17 +672,45 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None):
+    def _q_sample(self, x, t, noise=None):
+        """ same as above - for readability
+        """
+        noise = noise or torch.randn_like(x)
+        shape = (len(x), *[1] * (x.dim() - 1)) # (b, ...ones)
+        _a = self.sqrt_alphas_cumprod
+        _b = self.sqrt_one_minus_alphas_cumprod
+
+        return _a[t].view(shape)*x + _b[t].view(shape)*noise
+
+    # def _q_sample_lerp(self, x_start, t, noise=None):
+    #     """ to test: lerp over self.alphas_cumprod[t]
+    #     """
+    #     noise = noise or torch.randn_like(x_start)
+    #     shape = (len(x_start), *[1] * (x_start.dim() - 1))
+    #     return torch.lerp(x_start, noise, self.alphas_cumprod[t].view(shape))
+
+    def p_losses(self, x_start, t, noise=None):
         b, c, h, w = x_start.shape
+        # training noise
         noise = default(noise, lambda: torch.randn_like(x_start))
 
+        # per batch sample: x*sqrt(alpha) + noise*(1-sqrt(alpha))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+    
+        # Unet
         x_recon = self.denoise_fn(x_noisy, t)
 
         if self.loss_type == 'l1':
             loss = (noise - x_recon).abs().mean()
         elif self.loss_type == 'l2':
             loss = F.mse_loss(noise, x_recon)
+
+        # what if we minimize the distance to image given no- this should also learn something
+        elif self.loss_type == '-l1':
+            loss = (x_start - x_recon).abs().mean()
+
+        # ELBO minimization is KLD, not L1 or L2... what does this mean.
+
         else:
             raise NotImplementedError()
 
@@ -532,8 +719,8 @@ class GaussianDiffusion(nn.Module):
     def forward(self, x, *args, **kwargs):
         b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        # per batchrandom noise blend 1/num_timesteps
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        # print(f"  GaussianDiffusion().forward(), t {t}, timesteps {self.num_timesteps}")
         return self.p_losses(x, t, *args, **kwargs)
 
 # dataset classes
@@ -541,25 +728,35 @@ class GaussianDiffusion(nn.Module):
 class Dataset(data.Dataset):
     """ added channels arg
     """
-    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png'], channels=3):
+    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png'], channels=3, resize_images=True):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
         self.channels = channels
 
-        self.transform = transforms.Compose([
-            transforms.Resize(image_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda t: (t * 2) - 1)
-        ])
+        # @xvdp this set of transforms doesn make much sense
+        # Resize & Crop should be different sizes for randomness
+        if resize_images:
+            self.transform = transforms.Compose([
+                transforms.Resize(image_size),
+                transforms.RandomHorizontalFlip(),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda t: (t * 2) - 1)
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda t: (t * 2) - 1)
+            ])
 
     def __len__(self):
         return len(self.paths)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index=None):
+        index = index if index is not None else random.randint(0, len(self)-1)
         path = self.paths[index]
         try: # fault tolerant image loading
             img = Image.open(path)
@@ -568,24 +765,9 @@ class Dataset(data.Dataset):
             else:
                 img = img.convert('RGB')
         except:
-            return self.__getitem__(random.randint(0,len(self.paths)))
+            return self.__getitem__()
         return self.transform(img)
 
-# trainer class
-def strf (x):
-    """ format time output
-    strf = lambda x: f"{int(x//86400)}D{int((x//3600)%24):02d}:{int((x//60)%60):02d}:{int(x%60):02d}s"
-    """
-    days = int(x//86400)
-    hours = int((x//3600)%24)
-    minutes = int((x//60)%60)
-    seconds = int(x%60)
-    out = f"{minutes:02d}:{seconds:02d}"
-    if hours or days:
-        out = f"{hours:02d}:{out}"
-        if days:
-            out = f"{days}_{out}"
-    return out
 
 class Trainer(object):
     def __init__(
@@ -594,7 +776,7 @@ class Trainer(object):
         folder,
         *,
         ema_decay = 0.995,
-        train_batch_size = 48, 
+        train_batch_size = 48,
         train_lr = 2e-5,
         train_num_steps = 100000,
         gradient_accumulate_every = 2,
@@ -603,6 +785,8 @@ class Trainer(object):
         update_ema_every = 10,
         save_and_sample_every = 1000,
         results_folder = './results',
+        resize_images = True, # if false Dataset loads images as they are
+        num_workers=4, # default num_workers should be ~cores//3
         milestone = None
     ):
         """
@@ -626,8 +810,8 @@ class Trainer(object):
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
 
-        self.ds = Dataset(folder, self.image_size, channels=diffusion_model.channels)
-        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, pin_memory=True))
+        self.ds = Dataset(folder, self.image_size, channels=diffusion_model.channels, resize_images=resize_images)
+        self.dl = cycle(data.DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=num_workers))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
 
         self.step = 0
@@ -651,6 +835,7 @@ class Trainer(object):
             print(f"loading milestone {milestone}")
             self.load(milestone)
         else:
+            print("Resetting parameters")
             self.reset_parameters()
 
     def reset_parameters(self):
@@ -682,12 +867,14 @@ class Trainer(object):
         self.model.load_state_dict(data['model'])
         self.ema_model.load_state_dict(data['ema'])
 
+  
     def train(self):
         time_start = time.time()
         backwards = partial(loss_backwards, self.fp16)
         zero_step = self.step
 
-        self._cont(True)
+        self._cont(True, name="_stop")  # when deleted stop immediately
+        self._cont(True, name="_softstop") # when deleted wait until next milestone
         _msg = ""
 
         while self.step < self.train_num_steps:
@@ -709,7 +896,7 @@ class Trainer(object):
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-            if not self._cont() or (self.step != zero_step and self.step % self.save_and_sample_every == 0):
+            if not self._cont(name="_stop") or (self.step != zero_step and self.step % self.save_and_sample_every == 0):
                 milestone = self.step # // self.save_and_sample_every
                 batches = num_to_groups(36, self.batch_size)
                 all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
@@ -719,7 +906,7 @@ class Trainer(object):
                 utils.save_image(all_images, image_name, nrow = 6)
                 self.save(milestone, verbose=True)
 
-                if not self._cont():
+                if not self._cont(name="_stop") or not self._cont(name="_softstop"):
                     _msg = f"interupted training, at step {self.step}"
                     break
 
@@ -727,11 +914,11 @@ class Trainer(object):
 
         print(f'training completed {_msg}')
 
-    def _cont(self, init=False):
+    def _cont(self, init=False, name="_continue_training"):
         """
-        Create place holder file. Kill file to stop training.
+        Create place holder file. Delete file to stop training.
         """
-        _cont = osp.join(self.results_folder, "_continue_training")
+        _cont = osp.join(self.results_folder, name)
         if init and not osp.isfile(_cont):
             with open(_cont, "w") as _fi:
                 pass
