@@ -468,6 +468,11 @@ class GaussianDiffusion(nn.Module):
         self.appendout(model_mean, f"3.-> x1 c_1 + x0 c_2 : model_mean μ{model_mean.mean().item():.3f}, σ{model_mean.std().item():.3f}") # 2
         return model_mean, posterior_variance, posterior_log_variance
 
+    ##
+    # alternate formlations for readability of
+    # predict start from noise
+    # p mean variance
+    # q_posterior
     def _predict_start_from_noise(self, x, t, noise):
         """ same as above, fore readability
         """
