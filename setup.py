@@ -3,12 +3,12 @@ from setuptools import setup, find_packages
 setup(
   name = 'denoising-diffusion-pytorch',
   packages = find_packages(),
-  version = '0.7.1.2',
+  version = '0.7.1.1',
   license='MIT',
   description = 'Denoising Diffusion Probabilistic Models - Pytorch',
   author = 'Phil Wang',
-  author_email = 'lucidrains@gmail.com',
-  url = 'https://github.com/lucidrains/denoising-diffusion-pytorch',
+  author_email = 'xvdpahlen@gmail.com based on lucidrains@gmail.com',
+  url = 'https://github.com/xvdp/denoising-diffusion-pytorch',
   keywords = [
     'artificial intelligence',
     'generative models'

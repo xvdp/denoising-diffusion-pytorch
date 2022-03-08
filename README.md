@@ -2,6 +2,18 @@
 
 ## Denoising Diffusion Probabilistic Model, in Pytorch
 
+## x_dev branch : xvdp modifications
+* config.yaml for training: requires dependency koreto
+* script.py wrapping training or sampling
+
+    -   edit config.yaml, call script.run(config=<>)
+
+* .sample_vid() saving sample generation to video: requires dependency vidi
+* notebook inspecting parameters of model
+
+----
+### Original content
+
 Implementation of <a href="https://arxiv.org/abs/2006.11239">Denoising Diffusion Probabilistic Model</a> in Pytorch. It is a new approach to generative modeling that may <a href="https://ajolicoeur.wordpress.com/the-new-contender-to-gans-score-matching-with-langevin-sampling/">have the potential</a> to rival GANs. It uses denoising score matching to estimate the gradient of the data distribution, followed by Langevin sampling to sample from the true distribution.
 
 This implementation was transcribed from the official Tensorflow version <a href="https://github.com/hojonathanho/diffusion">here</a> and then modified to use <a href="https://arxiv.org/abs/2201.03545">ConvNext</a> blocks instead of Resnets.
@@ -75,15 +87,6 @@ trainer.train()
 ```
 
 Samples and model checkpoints will be logged to `./results` periodically
-
-## xvdp modifications
-* config.yaml for training
-* script.py wrapping training or sampling
-
-    -   edit config.yaml, call script.run(config=<>)
-
-* .sample_vid() saving sample generation to video
-* notebook inspecting parameters of model
 
 ## Citations
 
