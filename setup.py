@@ -13,16 +13,16 @@ setup(
     'artificial intelligence',
     'generative models'
   ],
-  install_requires=[
-    'einops',
-    'numpy',
-    'pillow',
-    'torch',
-    'torchvision',
-    'tqdm',
-    "koreto @ git+https://github.com/xvdp/koreto.git",
-    "vidi @ git+https://github.com/xvdp/vidi.git",
-  ],
+  # install_requires=[
+  #   'einops',
+  #   'numpy',
+  #   'pillow',
+  #   'torch',
+  #   'torchvision',
+  #   'tqdm',
+  #   "koreto @ git+https://github.com/xvdp/koreto.git",
+  #   "vidi @ git+https://github.com/xvdp/vidi.git",
+  # ],
   classifiers=[
     'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
